@@ -201,65 +201,84 @@
     // ── Main logic ────────────────────────────────────────────────────────────
     async function init() {
       let matches = [];
-
       try {
-        // 1. Acquire Graph token silently via MSAL
-        const msalInstance = new msal.PublicClientApplication(msalConfig);
-        await msalInstance.initialize();
+    // 1. Acquire Graph token via MSAL
+      const msalInstance = new msal.PublicClientApplication(msalConfig);
+      await msalInstance.initialize();
 
-        let tokenResponse;
-        try {
-          // Try silent acquisition first (user already signed into M365)
-          const accounts = msalInstance.getAllAccounts();
-          if (accounts.length === 0) throw new Error("No MSAL account found");
-          tokenResponse = await msalInstance.acquireTokenSilent({
-            ...tokenRequest,
-            account: accounts[0]
-          });
-        } catch (silentErr) {
-          // Silent failed — fall back to redirect (rare; only if session expired)
-          console.warn("Silent token acquisition failed:", silentErr);
-          await msalInstance.acquireTokenRedirect(tokenRequest);
-          return; // page will reload after redirect
-        }
+    // Clear any stale interaction lock from previous failed attempts
+    Object.keys(sessionStorage)
+      .filter(k => k.includes('interaction.status'))
+      .forEach(k => sessionStorage.removeItem(k));
 
-        const token = tokenResponse.accessToken;
+    let tokenResponse;
+    const accounts = msalInstance.getAllAccounts();
 
-        // 2. Get user's transitive group memberships from Graph
-        const graphData = await getJson(
-          "https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=displayName&$top=200",
-          token
-        );
-        const userGroups = graphData.value.map(g => g.displayName);
-
-        // 3. Load DepartmentMappings list from SharePoint
-        const listData = await getJson(
-          `${MAPPINGS_SITE}/_api/web/lists/getbytitle('DepartmentMappings')/items?$select=GroupName,SiteUrl,DeptLabel&$top=100`
-        );
-
-        // 4. Find all matching groups — preserves list order (row order = priority)
-        matches = listData.value.filter(item =>
-          userGroups.includes(item.GroupName)
-        );
-
-      } catch (err) {
-        console.error("DeptButton error:", err);
+    if (accounts.length === 0) {
+      // No cached session — require interactive login
+      try {
+        const loginResponse = await msalInstance.loginPopup({
+          scopes: ["GroupMember.Read.All"]
+        });
+        msalInstance.setActiveAccount(loginResponse.account);
+        tokenResponse = loginResponse;
+      } catch (loginErr) {
+        console.error("Login popup failed:", loginErr);
         showError();
         return;
       }
-
-      if (matches.length === 0) {
-        // No match — route to fallback silently
-        showSingle(FALLBACK_URL);
-      } else if (matches.length === 1) {
-        // Single match — plain nav button, no dropdown
-        showSingle(matches[0].SiteUrl);
-      } else {
-        // Multiple matches — show dropdown
-        showMulti(matches);
+    } else {
+      // Account found — try silent, fall back to popup
+      try {
+        tokenResponse = await msalInstance.acquireTokenSilent({
+          ...tokenRequest,
+          account: accounts[0]
+        });
+      } catch (silentErr) {
+        console.warn("Silent token acquisition failed:", silentErr);
+        try {
+          tokenResponse = await msalInstance.acquireTokenPopup(tokenRequest);
+        } catch (popupErr) {
+          console.error("Popup token acquisition failed:", popupErr);
+          showError();
+          return;
+        }
       }
     }
 
+    const token = tokenResponse.accessToken;
+
+    // 2. Get user's transitive group memberships from Graph
+    const graphData = await getJson(
+      "https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=displayName&$top=200",
+      token
+    );
+    const userGroups = graphData.value.map(g => g.displayName);
+
+    // 3. Load DepartmentMappings list from SharePoint
+    const listData = await getJson(
+      `${MAPPINGS_SITE}/_api/web/lists/getbytitle('DepartmentMappings')/items?$select=GroupName,SiteUrl,DeptLabel&$top=100`
+    );
+
+    // 4. Find all matching groups
+    matches = listData.value.filter(item =>
+      userGroups.includes(item.GroupName)
+    );
+
+  } catch (err) {
+    console.error("DeptButton error:", err);
+    showError();
+    return;
+  }
+
+  if (matches.length === 0) {
+    showSingle(FALLBACK_URL);
+  } else if (matches.length === 1) {
+    showSingle(matches[0].SiteUrl);
+  } else {
+    showMulti(matches);
+  }
+}
     // ── Render: single department ─────────────────────────────────────────────
     function showSingle(url) {
       loading.style.display = "none";
