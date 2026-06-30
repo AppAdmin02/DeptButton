@@ -200,54 +200,86 @@
 
     // ── Main logic ────────────────────────────────────────────────────────────
     async function init() {
-      let matches = [];
-      try {
-    // 1. Acquire Graph token via MSAL
-      const msalInstance = new msal.PublicClientApplication(msalConfig);
-      await msalInstance.initialize();
+  let matches = [];
+  try {
+    const msalInstance = new msal.PublicClientApplication(msalConfig);
+    await msalInstance.initialize();
 
-    // Clear any stale interaction lock from previous failed attempts
+    // Clear any stale interaction lock
     Object.keys(sessionStorage)
       .filter(k => k.includes('interaction.status'))
       .forEach(k => sessionStorage.removeItem(k));
 
     let tokenResponse;
-    const accounts = msalInstance.getAllAccounts();
+    let accounts = msalInstance.getAllAccounts();
 
     if (accounts.length === 0) {
-      // No cached session — require interactive login
+      // No session — login first, then acquire token separately
       try {
         const loginResponse = await msalInstance.loginPopup({
-          scopes: ["GroupMember.Read.All"]
+          scopes: ["User.Read"]
         });
         msalInstance.setActiveAccount(loginResponse.account);
-        tokenResponse = loginResponse;
+        accounts = msalInstance.getAllAccounts();
       } catch (loginErr) {
         console.error("Login popup failed:", loginErr);
         showError();
         return;
       }
-    } else {
-      // Account found — try silent, fall back to popup
+    }
+
+    // Now acquire Graph token with correct scopes
+    try {
+      tokenResponse = await msalInstance.acquireTokenSilent({
+        scopes: ["User.Read", "GroupMember.Read.All"],
+        account: accounts[0]
+      });
+    } catch (silentErr) {
+      console.warn("Silent token failed, trying popup:", silentErr);
       try {
-        tokenResponse = await msalInstance.acquireTokenSilent({
-          ...tokenRequest,
-          account: accounts[0]
+        tokenResponse = await msalInstance.acquireTokenPopup({
+          scopes: ["User.Read", "GroupMember.Read.All"]
         });
-      } catch (silentErr) {
-        console.warn("Silent token acquisition failed:", silentErr);
-        try {
-          tokenResponse = await msalInstance.acquireTokenPopup(tokenRequest);
-        } catch (popupErr) {
-          console.error("Popup token acquisition failed:", popupErr);
-          showError();
-          return;
-        }
+      } catch (popupErr) {
+        console.error("Token popup failed:", popupErr);
+        showError();
+        return;
       }
     }
 
     const token = tokenResponse.accessToken;
 
+    // Get user's transitive group memberships from Graph
+    const graphData = await getJson(
+      "https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=displayName&$top=200",
+      token
+    );
+    const userGroups = graphData.value.map(g => g.displayName);
+
+    // Load DepartmentMappings list from SharePoint
+    const listData = await getJson(
+      `${MAPPINGS_SITE}/_api/web/lists/getbytitle('DepartmentMappings')/items?$select=GroupName,SiteUrl,DeptLabel&$top=100`
+    );
+
+    // Find all matching groups
+    matches = listData.value.filter(item =>
+      userGroups.includes(item.GroupName)
+    );
+
+  } catch (err) {
+    console.error("DeptButton error:", err);
+    showError();
+    return;
+  }
+
+  if (matches.length === 0) {
+    showSingle(FALLBACK_URL);
+  } else if (matches.length === 1) {
+    showSingle(matches[0].SiteUrl);
+  } else {
+    showMulti(matches);
+  }
+}
     // 2. Get user's transitive group memberships from Graph
     const graphData = await getJson(
       "https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=displayName&$top=200",
